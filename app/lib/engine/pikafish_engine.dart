@@ -13,6 +13,8 @@ class PikafishEngine {
   String? _enginePath;
   bool _isSearching = false;
   String? _nnuePath; // NNUE文件的绝对路径
+  String? _debugLogPath; // 引擎调试日志路径
+  String? _cacheDir; // 缓存目录路径
 
   // 同步等待机制
   String? _waitToken;
@@ -38,6 +40,15 @@ class PikafishEngine {
 
   /// 选中的引擎变体名称
   String engineVariant = '';
+
+  /// 强制使用基础引擎变体（当 dotprod 变体失败时）
+  bool forceBasicVariant = false;
+
+  /// 抑制回调（用于 NNUE 测试搜索期间）
+  bool _suppressCallbacks = false;
+
+  /// _waitFor 使用前缀匹配（而非精确匹配）
+  bool _waitPrefix = false;
 
   /// 调试日志
   final List<String> _debugLog = [];
@@ -93,7 +104,38 @@ class PikafishEngine {
         final nnueFile = File(nnuePath);
         if (await nnueFile.exists()) {
           final nnueSize = await nnueFile.length();
-          _nnuePath = nnuePath; // 保存绝对路径，后续设置EvalFile用
+          _nnuePath = nnuePath;
+
+          // *** 从Dart侧验证文件可读且完整 ***
+          try {
+            final raf = await nnueFile.open(mode: FileMode.read);
+            final header = await raf.read(16);
+            await raf.close();
+            final headerHex = header.map((b) => b.toRadixString(16).padLeft(2, '0')).join(' ');
+            _log('NNUE header (16 bytes): $headerHex');
+
+            // 验证 NNUE raw header:
+            // 前4字节 = Version (0x7AF32F20 little-endian = 20 2F F3 7A)
+            // 后4字节 = Hash (0x6E24D34A little-endian = 4A D3 24 6E)
+            if (header.length >= 8 &&
+                header[0] == 0x20 && header[1] == 0x2F &&
+                header[2] == 0xF3 && header[3] == 0x7A &&
+                header[4] == 0x4A && header[5] == 0xD3 &&
+                header[6] == 0x24 && header[7] == 0x6E) {
+              _log('NNUE raw header verified (version=0x7AF32F20, hash=0x6E24D34A)');
+            } else if (header.length >= 4 &&
+                header[0] == 0x28 && header[1] == 0xB5 &&
+                header[2] == 0x2F && header[3] == 0xFD) {
+              _log('WARNING: NNUE file is zstd compressed! Engine may not support zstd.');
+            } else {
+              _log('ERROR: NNUE file has unknown header format!');
+              return false;
+            }
+          } catch (e) {
+            _log('ERROR: Cannot read NNUE file from Dart: $e');
+            return false;
+          }
+
           _log('NNUE ready: $nnuePath (${(nnueSize / 1024 / 1024).toStringAsFixed(2)} MB)');
           return true;
         }
@@ -146,16 +188,19 @@ class PikafishEngine {
     final cpuFeatures = await _getCpuFeatures();
     final cpuArch = await _getCpuArchitecture();
     _log('CPU arch: $cpuArch');
-    _log('CPU features: ${cpuFeatures.take(15).join(' ')}');
+    _log('CPU features: ${cpuFeatures.join(' ')}');
 
     // 优先: dotprod变体（现代ARM处理器性能更好）
-    if (cpuFeatures.contains('asimddp') || cpuFeatures.contains('dotprod')) {
+    if (!forceBasicVariant &&
+        (cpuFeatures.contains('asimddp') || cpuFeatures.contains('dotprod'))) {
       final dotprodPath = '$nativeDir/libpikafish_dotprod.so';
       if (await File(dotprodPath).exists()) {
         engineVariant = 'armv8-dotprod';
         _log('Selected: dotprod variant (best for this CPU)');
         return dotprodPath;
       }
+    } else if (forceBasicVariant) {
+      _log('Dotprod variant skipped (forceBasicVariant=true)');
     }
 
     // 回退: 基础armv8变体
@@ -211,23 +256,53 @@ class PikafishEngine {
       try {
         const platform = MethodChannel('com.xiangqi.chinese_chess/engine');
         workDir = await platform.invokeMethod<String>('getCacheDir');
+        _cacheDir = workDir;
         _log('Working dir: $workDir');
       } catch (e) {
         _log('getCacheDir failed: $e');
       }
 
       _log('Starting engine process...');
-      _process = await Process.start(
-        _enginePath!,
-        [],
-        mode: ProcessStartMode.normal,
-        workingDirectory: workDir,
-      );
+
+      // 验证 NNUE 文件在工作目录中存在
+      if (workDir != null && _nnuePath != null) {
+        final nnueInWorkDir = File('$workDir/pikafish.nnue');
+        final existsInWD = await nnueInWorkDir.exists();
+        _log('NNUE in workDir ($workDir): ${existsInWD ? "EXISTS" : "MISSING"}');
+        if (existsInWD) {
+          _log('  size: ${await nnueInWorkDir.length()} bytes');
+        }
+      }
+
+      // *** 关键诊断：测试子进程能否读取 NNUE 文件 ***
+      // 引擎也是子进程，如果子进程无法读取，引擎也无法读取
+      if (_nnuePath != null) {
+        await _testSubprocessFileAccess(_nnuePath!, workDir);
+      }
+
+      // *** 关键修复：通过 shell cd + exec 保证 CWD ***
+      // Process.start 的 workingDirectory 在某些 Android 设备上不生效
+      // 使用 sh -c 'cd <dir> && exec <engine>' 保证 CWD 正确设置
+      if (workDir != null) {
+        _process = await Process.start(
+          '/system/bin/sh',
+          ['-c', 'cd "$workDir" && exec "$_enginePath"'],
+          mode: ProcessStartMode.normal,
+        );
+      } else {
+        _process = await Process.start(
+          _enginePath!,
+          [],
+          mode: ProcessStartMode.normal,
+        );
+      }
       _log('Engine PID: ${_process!.pid}');
 
       // *** 关键：监控进程退出 ***
       _process!.exitCode.then((code) {
         _log('*** ENGINE EXITED with code: $code ***');
+        // 读取引擎调试日志（fire-and-forget）
+        _readEngineDebugLog();
         final wasSearching = _isSearching;
         _isReady = false;
         _isSearching = false;
@@ -290,31 +365,43 @@ class PikafishEngine {
     if (_waitToken != null &&
         _waitCompleter != null &&
         !_waitCompleter!.isCompleted) {
-      if (line.trim() == _waitToken) {
+      final trimmed = line.trim();
+      final match = _waitPrefix
+          ? trimmed.startsWith(_waitToken!)
+          : trimmed == _waitToken;
+      if (match) {
         _waitCompleter!.complete(true);
         _waitToken = null;
+        _waitPrefix = false;
       }
     }
 
     // bestmove 处理
     if (line.startsWith('bestmove')) {
       _isSearching = false;
-      final parts = line.split(' ');
-      final bestMove = parts.length > 1 ? parts[1] : '';
-      final ponder =
-          parts.length > 3 && parts[2] == 'ponder' ? parts[3] : null;
-      onBestMove?.call(bestMove, ponder);
+      if (!_suppressCallbacks) {
+        final parts = line.split(' ');
+        final bestMove = parts.length > 1 ? parts[1] : '';
+        final ponder =
+            parts.length > 3 && parts[2] == 'ponder' ? parts[3] : null;
+        onBestMove?.call(bestMove, ponder);
+      }
     }
     // 搜索信息
     else if (line.startsWith('info')) {
-      onInfo?.call(line);
+      if (!_suppressCallbacks) {
+        onInfo?.call(line);
+      }
     }
   }
 
   /// 等待引擎输出特定token
+  /// prefix=true 时使用 startsWith 匹配（如等待 'bestmove' 前缀）
   Future<bool> _waitFor(String token,
-      {Duration timeout = const Duration(seconds: 5)}) async {
+      {Duration timeout = const Duration(seconds: 5),
+       bool prefix = false}) async {
     _waitToken = token;
+    _waitPrefix = prefix;
     _waitCompleter = Completer<bool>();
 
     try {
@@ -357,13 +444,38 @@ class PikafishEngine {
 
   /// 配置引擎参数
   Future<void> configureMaxStrength() async {
-    // *** 关键：设置NNUE文件的绝对路径，否则引擎找不到会崩溃 ***
-    if (_nnuePath != null) {
-      _sendCommand('setoption name EvalFile value $_nnuePath');
-      _log('Set EvalFile: $_nnuePath');
-    } else {
-      _log('WARN: _nnuePath is null, EvalFile not set!');
+    // 启用引擎调试日志文件（记录所有 UCI 通信和内部消息）
+    if (_cacheDir != null) {
+      _debugLogPath = '$_cacheDir/engine_debug.log';
+      try {
+        final oldLog = File(_debugLogPath!);
+        if (await oldLog.exists()) await oldLog.delete();
+      } catch (_) {}
+      _sendCommand('setoption name Debug Log File value $_debugLogPath');
+      await _flush();
+      _log('Debug Log File: $_debugLogPath');
     }
+
+    // *** 策略：依赖 CWD 自动加载（shell cd 已保证 CWD = cache dir）***
+    // 引擎构造函数会自动从 CWD 加载 "pikafish.nnue"
+    // EvalFile 默认值就是 "pikafish.nnue"，verify() 会对比这个值
+    // 如果构造函数已成功加载，evalFile.current = "pikafish.nnue"，verify 通过
+    //
+    // 同时也尝试绝对路径作为后备
+    if (_nnuePath != null) {
+      _log('NNUE at: $_nnuePath (engine should auto-load via CWD)');
+      // 先 isready 确认引擎初始化完成（构造函数中会尝试加载 NNUE）
+      _sendCommand('isready');
+      await _flush();
+      final initReady = await _waitFor('readyok',
+          timeout: const Duration(seconds: 30));
+      if (initReady) {
+        _log('Engine init readyok (NNUE may have loaded from CWD)');
+      } else {
+        _log('WARNING: Engine not responding after init');
+      }
+    }
+
     final cores = Platform.numberOfProcessors;
     // 线程数：留1个核给系统，最多4个确保稳定
     final threads = (cores > 1 ? cores - 1 : 1).clamp(1, 4);
@@ -372,7 +484,49 @@ class PikafishEngine {
     _sendCommand('setoption name Hash value 64');
     // 注意：Pikafish没有"Skill Level"选项，不要发送
     await _flush();
-    _log('Config: EvalFile set, Threads=$threads, Hash=64MB');
+    _log('Config: Threads=$threads, Hash=64MB');
+  }
+
+  /// *** 关键：初始化后立即测试 NNUE 是否真正加载成功 ***
+  /// 发送 depth 1 搜索，如果 NNUE 未加载，引擎会在 verify() 时 exit(1)
+  /// 必须在 syncNewGame() 之后调用
+  Future<bool> testNnueLoading() async {
+    if (!_isReady || _process == null) {
+      _log('Cannot test NNUE: engine not ready');
+      return false;
+    }
+
+    _log('=== NNUE Loading Test: depth 1 search ===');
+    _suppressCallbacks = true;
+
+    try {
+      // 用初始局面测试
+      _sendCommand('position startpos');
+      _isSearching = true;
+      _sendCommand('go depth 1 movetime 3000');
+      await _flush();
+
+      // 等待 bestmove（表示 NNUE 加载成功并能正常搜索）
+      final gotBestMove = await _waitFor('bestmove',
+          timeout: const Duration(seconds: 10), prefix: true);
+
+      _isSearching = false;
+
+      if (gotBestMove) {
+        _log('=== NNUE TEST PASSED: Engine can search ===');
+        // 重置引擎状态
+        _sendCommand('ucinewgame');
+        _sendCommand('isready');
+        await _flush();
+        await _waitFor('readyok', timeout: const Duration(seconds: 5));
+        return true;
+      } else {
+        _log('=== NNUE TEST FAILED: No bestmove (NNUE not loaded or engine crashed) ===');
+        return false;
+      }
+    } finally {
+      _suppressCallbacks = false;
+    }
   }
 
   /// 开始新游戏（带同步等待确保引擎就绪）
@@ -429,6 +583,75 @@ class PikafishEngine {
       try {
         _process?.stdin.flush();
       } catch (_) {}
+    }
+  }
+
+  /// 测试子进程能否读取文件（与引擎子进程具有相同的权限上下文）
+  Future<void> _testSubprocessFileAccess(String filePath, String? workDir) async {
+    _log('--- Subprocess file access test ---');
+    // Test 1: ls -la
+    try {
+      final ls = await Process.run('ls', ['-la', filePath]);
+      _log('ls: ${ls.stdout.toString().trim()}');
+      if (ls.exitCode != 0) _log('ls stderr: ${ls.stderr}');
+    } catch (e) {
+      _log('ls failed: $e');
+    }
+    // Test 2: wc -c（验证文件可完整读取）
+    try {
+      final wc = await Process.run('wc', ['-c', filePath]);
+      _log('wc -c: ${wc.stdout.toString().trim()}');
+      if (wc.exitCode != 0) _log('wc stderr: ${wc.stderr}');
+    } catch (e) {
+      _log('wc failed: $e');
+    }
+    // Test 3: sha256sum（验证文件完整性）
+    try {
+      final sha = await Process.run('sha256sum', [filePath]);
+      _log('sha256sum: ${sha.stdout.toString().trim()}');
+      if (sha.exitCode != 0) _log('sha256sum stderr: ${sha.stderr}');
+    } catch (e) {
+      _log('sha256sum N/A: $e');
+    }
+    // Test 4: od 前16字节（从子进程验证文件头内容）
+    try {
+      final od = await Process.run('od', ['-A', 'x', '-t', 'x1', '-N', '16', filePath]);
+      _log('od header: ${od.stdout.toString().trim()}');
+    } catch (e) {
+      _log('od failed: $e');
+    }
+    // Test 5: 从工作目录测试相对路径访问
+    if (workDir != null) {
+      try {
+        final ls2 = await Process.run('ls', ['-la', 'pikafish.nnue'],
+            workingDirectory: workDir);
+        _log('ls (CWD relative): ${ls2.stdout.toString().trim()}');
+        if (ls2.exitCode != 0) _log('ls relative stderr: ${ls2.stderr}');
+      } catch (e) {
+        _log('ls relative failed: $e');
+      }
+    }
+    _log('--- End subprocess test ---');
+  }
+
+  /// 读取引擎调试日志（引擎崩溃后调用）
+  Future<void> _readEngineDebugLog() async {
+    if (_debugLogPath == null) return;
+    try {
+      final f = File(_debugLogPath!);
+      if (await f.exists()) {
+        final content = await f.readAsString();
+        final lines = content.split('\n');
+        _log('=== ENGINE DEBUG LOG (${lines.length} lines) ===');
+        for (final line in lines.take(100)) {
+          _log('DBG: $line');
+        }
+        _log('=== END ENGINE DEBUG LOG ===');
+      } else {
+        _log('Engine debug log not created at: $_debugLogPath');
+      }
+    } catch (e) {
+      _log('Cannot read engine debug log: $e');
     }
   }
 

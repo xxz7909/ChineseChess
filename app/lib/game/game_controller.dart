@@ -56,8 +56,40 @@ class GameController extends ChangeNotifier {
     if (engineReady) {
       await engine.configureMaxStrength();
       await engine.syncNewGame();
-      engineInfo = '引擎: Pikafish (${engine.engineVariant})';
-      statusMessage = '红方先行';
+
+      // *** 关键：立即测试NNUE是否真正加载成功 ***
+      final nnueOk = await engine.testNnueLoading();
+      if (!nnueOk) {
+        // NNUE 加载失败！尝试使用基础引擎变体
+        engine.dispose();
+        if (!engine.forceBasicVariant) {
+          engine.forceBasicVariant = true;
+          engineReady = await engine.init();
+          if (engineReady) {
+            await engine.configureMaxStrength();
+            await engine.syncNewGame();
+            final retryOk = await engine.testNnueLoading();
+            if (retryOk) {
+              engineInfo = '引擎: Pikafish (${engine.engineVariant}) [回退]';
+              statusMessage = '红方先行';
+            } else {
+              engineReady = false;
+              statusMessage = '引擎NNUE加载失败（两种变体均失败）';
+              engineInfo = statusMessage;
+            }
+          } else {
+            statusMessage = '基础引擎加载失败';
+            engineInfo = statusMessage;
+          }
+        } else {
+          engineReady = false;
+          statusMessage = '引擎NNUE加载失败';
+          engineInfo = statusMessage;
+        }
+      } else {
+        engineInfo = '引擎: Pikafish (${engine.engineVariant})';
+        statusMessage = '红方先行';
+      }
     } else {
       statusMessage = '引擎加载失败';
       engineInfo = '引擎加载失败，请检查日志';
@@ -303,8 +335,15 @@ class GameController extends ChangeNotifier {
     if (engineReady) {
       await engine.configureMaxStrength();
       await engine.syncNewGame();
-      statusMessage = '引擎已重启，轮到你走';
-      engineInfo = '引擎: Pikafish (${engine.engineVariant}) [已重启]';
+      final nnueOk = await engine.testNnueLoading();
+      if (nnueOk) {
+        statusMessage = '引擎已重启，轮到你走';
+        engineInfo = '引擎: Pikafish (${engine.engineVariant}) [已重启]';
+      } else {
+        engineReady = false;
+        statusMessage = '引擎NNUE加载失败（重启后仍然有问题）';
+        engineInfo = statusMessage;
+      }
     } else {
       statusMessage = '引擎重启失败';
       engineInfo = '引擎重启失败';
