@@ -12,6 +12,7 @@ class PikafishEngine {
   bool _isReady = false;
   String? _enginePath;
   bool _isSearching = false;
+  String? _nnuePath; // NNUE文件的绝对路径
 
   // 同步等待机制
   String? _waitToken;
@@ -92,6 +93,7 @@ class PikafishEngine {
         final nnueFile = File(nnuePath);
         if (await nnueFile.exists()) {
           final nnueSize = await nnueFile.length();
+          _nnuePath = nnuePath; // 保存绝对路径，后续设置EvalFile用
           _log('NNUE ready: $nnuePath (${(nnueSize / 1024 / 1024).toStringAsFixed(2)} MB)');
           return true;
         }
@@ -353,18 +355,24 @@ class PikafishEngine {
     }
   }
 
-  /// 配置最强难度
+  /// 配置引擎参数
   Future<void> configureMaxStrength() async {
+    // *** 关键：设置NNUE文件的绝对路径，否则引擎找不到会崩溃 ***
+    if (_nnuePath != null) {
+      _sendCommand('setoption name EvalFile value $_nnuePath');
+      _log('Set EvalFile: $_nnuePath');
+    } else {
+      _log('WARN: _nnuePath is null, EvalFile not set!');
+    }
     final cores = Platform.numberOfProcessors;
     // 线程数：留1个核给系统，最多4个确保稳定
     final threads = (cores > 1 ? cores - 1 : 1).clamp(1, 4);
     _sendCommand('setoption name Threads value $threads');
     // Hash: 64MB，对手机友好
     _sendCommand('setoption name Hash value 64');
-    // 最高棋力
-    _sendCommand('setoption name Skill Level value 20');
+    // 注意：Pikafish没有"Skill Level"选项，不要发送
     await _flush();
-    _log('Config: Threads=$threads, Hash=64MB, SkillLevel=20');
+    _log('Config: EvalFile set, Threads=$threads, Hash=64MB');
   }
 
   /// 开始新游戏（带同步等待确保引擎就绪）
