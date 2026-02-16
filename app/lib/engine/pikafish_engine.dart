@@ -280,22 +280,15 @@ class PikafishEngine {
         await _testSubprocessFileAccess(_nnuePath!, workDir);
       }
 
-      // *** 关键修复：通过 shell cd + exec 保证 CWD ***
-      // Process.start 的 workingDirectory 在某些 Android 设备上不生效
-      // 使用 sh -c 'cd <dir> && exec <engine>' 保证 CWD 正确设置
-      if (workDir != null) {
-        _process = await Process.start(
-          '/system/bin/sh',
-          ['-c', 'cd "$workDir" && exec "$_enginePath"'],
-          mode: ProcessStartMode.normal,
-        );
-      } else {
-        _process = await Process.start(
-          _enginePath!,
-          [],
-          mode: ProcessStartMode.normal,
-        );
-      }
+      // 直接启动引擎进程
+      // 注意：不依赖 workingDirectory 来加载 NNUE
+      // NNUE 通过 setoption name EvalFile value <绝对路径> 在 configureMaxStrength 中指定
+      _process = await Process.start(
+        _enginePath!,
+        [],
+        mode: ProcessStartMode.normal,
+        workingDirectory: workDir, // best-effort CWD，不依赖它
+      );
       _log('Engine PID: ${_process!.pid}');
 
       // *** 关键：监控进程退出 ***
@@ -442,9 +435,17 @@ class PikafishEngine {
     }
   }
 
-  /// 配置引擎参数
+  /// 配置引擎参数（严格按照正确的 UCI 启动顺序）
+  ///
+  /// 正确顺序（在 uci/uciok 之后）：
+  ///   1. setoption name EvalFile value <绝对路径>   ← 必须！
+  ///   2. setoption name Threads value N
+  ///   3. setoption name Hash value N
+  ///   4. isready → readyok
+  ///
+  /// ⚠️ 如果不设置 EvalFile 绝对路径，引擎在第一次 go 时会 exit(1)
   Future<void> configureMaxStrength() async {
-    // 启用引擎调试日志文件（记录所有 UCI 通信和内部消息）
+    // 1. 启用引擎调试日志文件
     if (_cacheDir != null) {
       _debugLogPath = '$_cacheDir/engine_debug.log';
       try {
@@ -456,35 +457,34 @@ class PikafishEngine {
       _log('Debug Log File: $_debugLogPath');
     }
 
-    // *** 策略：依赖 CWD 自动加载（shell cd 已保证 CWD = cache dir）***
-    // 引擎构造函数会自动从 CWD 加载 "pikafish.nnue"
-    // EvalFile 默认值就是 "pikafish.nnue"，verify() 会对比这个值
-    // 如果构造函数已成功加载，evalFile.current = "pikafish.nnue"，verify 通过
-    //
-    // 同时也尝试绝对路径作为后备
+    // 2. *** 最关键的一步：设置 EvalFile 绝对路径 ***
+    //    Android 上 CWD 不可靠（可能是 / 或其他系统目录）
+    //    必须用绝对路径告诉引擎 NNUE 文件在哪
     if (_nnuePath != null) {
-      _log('NNUE at: $_nnuePath (engine should auto-load via CWD)');
-      // 先 isready 确认引擎初始化完成（构造函数中会尝试加载 NNUE）
-      _sendCommand('isready');
+      _log('Setting EvalFile to: $_nnuePath');
+      _sendCommand('setoption name EvalFile value $_nnuePath');
       await _flush();
-      final initReady = await _waitFor('readyok',
-          timeout: const Duration(seconds: 30));
-      if (initReady) {
-        _log('Engine init readyok (NNUE may have loaded from CWD)');
-      } else {
-        _log('WARNING: Engine not responding after init');
-      }
+    } else {
+      _log('CRITICAL WARNING: No NNUE path! Engine WILL crash on first search!');
     }
 
+    // 3. 设置线程和哈希表
     final cores = Platform.numberOfProcessors;
-    // 线程数：留1个核给系统，最多4个确保稳定
     final threads = (cores > 1 ? cores - 1 : 1).clamp(1, 4);
     _sendCommand('setoption name Threads value $threads');
-    // Hash: 64MB，对手机友好
     _sendCommand('setoption name Hash value 64');
-    // 注意：Pikafish没有"Skill Level"选项，不要发送
     await _flush();
-    _log('Config: Threads=$threads, Hash=64MB');
+
+    // 4. isready → readyok（确认所有选项已应用，NNUE 文件已加载）
+    _sendCommand('isready');
+    await _flush();
+    final ready = await _waitFor('readyok',
+        timeout: const Duration(seconds: 30));
+    if (ready) {
+      _log('Config done: EvalFile=$_nnuePath, Threads=$threads, Hash=64MB');
+    } else {
+      _log('WARNING: Engine not responding after config (may have crashed loading NNUE)');
+    }
   }
 
   /// *** 关键：初始化后立即测试 NNUE 是否真正加载成功 ***
